@@ -2,6 +2,10 @@ package render
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -15,6 +19,7 @@ import (
 
 	"github.com/ghodss/yaml"
 	configv1 "github.com/openshift/api/config/v1"
+	configv1alpha1 "github.com/openshift/api/config/v1alpha1"
 	"github.com/openshift/api/features"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/ceohelpers"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -287,6 +292,64 @@ data:
     publish: External
     featureGates: [ShortCertRotation=false]
 `
+
+	clusterConfigMapWithCustomPKI = `
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-config-v1
+  namespace: kube-system
+data:
+  install-config: |
+    apiVersion: v1
+    baseDomain: gcp.devcluster.openshift.com
+    compute:
+    - architecture: amd64
+      hyperthreading: Enabled
+      name: worker
+      platform: {}
+      replicas: 3
+    controlPlane:
+      architecture: amd64
+      hyperthreading: Enabled
+      name: master
+      platform:
+        gcp:
+          osDisk:
+            DiskSizeGB: 128
+            DiskType: pd-ssd
+          type: n1-standard-4
+          zones:
+          - us-east1-b
+          - us-east1-c
+          - us-east1-d
+      replicas: 3
+    metadata:
+      creationTimestamp: null
+      name: my-cluster
+    networking:
+      clusterNetwork:
+      - cidr: 10.128.0.0/14
+        hostPrefix: 23
+      machineCIDR: 10.0.0.0/16
+      machineNetwork:
+      - cidr: 10.0.0.0/16
+      networkType: OpenShiftSDN
+      serviceNetwork:
+      - 172.30.0.0/16
+    platform:
+      gcp:
+        projectID: openshift
+        region: us-east1
+    publish: External
+    featureGates: [ConfigurablePKI=true]
+    pki:
+      signerCertificates:
+        key:
+          algorithm: ECDSA
+          ecdsa:
+            curve: P521
+`
 )
 
 type testConfig struct {
@@ -551,13 +614,61 @@ func TestTemplateDataSingleStack(t *testing.T) {
 	testTemplateData(config)
 }
 
-func testTemplateData(tc *testConfig) {
+func TestTemplateDataWithCustomPKI(t *testing.T) {
+	validateECDSAP521Signer := func(t *testing.T, td *TemplateData) {
+		if len(td.certificates) == 0 {
+			t.Fatal("no certificates generated")
+		}
+
+		var signerCert []byte
+		for _, cert := range td.certificates {
+			if cert.Name == "etcd-signer" {
+				signerCert = cert.Data["tls.crt"]
+				break
+			}
+		}
+
+		if signerCert == nil {
+			t.Fatal("etcd-signer certificate not found in generated certificates")
+		}
+
+		block, _ := pem.Decode(signerCert)
+		if block == nil {
+			t.Fatal("failed to decode PEM block from etcd-signer certificate")
+		}
+
+		x509Cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatalf("failed to parse x509 certificate: %v", err)
+		}
+
+		ecdsaKey, ok := x509Cert.PublicKey.(*ecdsa.PublicKey)
+		if !ok {
+			t.Fatalf("expected ECDSA public key, got %T", x509Cert.PublicKey)
+		}
+
+		if ecdsaKey.Curve != elliptic.P521() {
+			t.Errorf("expected P521 curve, got %v", ecdsaKey.Curve.Params().Name)
+		}
+	}
+
+	config := &testConfig{
+		t:                    t,
+		clusterNetworkConfig: networkConfigIpv4,
+		infraConfig:          infraConfig,
+		clusterConfigMap:     clusterConfigMapWithCustomPKI,
+	}
+
+	testTemplateData(config, validateECDSAP521Signer)
+}
+
+func testTemplateData(tc *testConfig, validators ...func(*testing.T, *TemplateData)) {
 	var errOut io.Writer
 	dir, err := ioutil.TempDir("/tmp", "assets-")
 	if err != nil {
 		tc.t.Fatal(err)
 	}
-	defer os.RemoveAll(dir) // clean up
+	defer os.RemoveAll(dir)
 
 	clusterConfigFile, err := ioutil.TempFile(dir, "cluster-network-02-config.*.yaml")
 	if err != nil {
@@ -624,6 +735,10 @@ func testTemplateData(tc *testConfig) {
 		tc.t.Errorf("BootstrapScalingStrategy want: %q got: %q", tc.want.BootstrapScalingStrategy, got.BootstrapScalingStrategy)
 	case tc.want.NamespaceAnnotations != nil && !reflect.DeepEqual(got.NamespaceAnnotations, tc.want.NamespaceAnnotations):
 		tc.t.Errorf("NamespaceAnnotations want: %q got: %q", tc.want.NamespaceAnnotations, got.NamespaceAnnotations)
+	}
+
+	for _, validate := range validators {
+		validate(tc.t, got)
 	}
 }
 
@@ -947,6 +1062,189 @@ featureGates: [ShortCertRotation=true, UpgradeStatus=foobar]
 			actualEnabled, actualDisabled := getFeatureGatesStatus(installConfig)
 			assert.Equal(t, actualEnabled, test.expectedEnabled)
 			assert.Equal(t, actualDisabled, test.expectedDisabled)
+		})
+	}
+}
+
+func Test_getPKIProfileProvider(t *testing.T) {
+	tests := map[string]struct {
+		installConfig      string
+		expectedAlgorithm  configv1alpha1.KeyAlgorithm
+		expectedRSAKeySize int32
+		expectedECDSACurve configv1alpha1.ECDSACurve
+		expectedError      bool
+	}{
+		"no pki config returns default profile": {
+			installConfig: `
+apiVersion: v1
+metadata:
+  name: my-cluster
+`,
+			expectedAlgorithm:  configv1alpha1.KeyAlgorithmECDSA,
+			expectedECDSACurve: configv1alpha1.ECDSACurveP384, // Default for signers
+		},
+		"pki with RSA 8192": {
+			installConfig: `
+apiVersion: v1
+metadata:
+  name: my-cluster
+pki:
+  signerCertificates:
+    key:
+      algorithm: RSA
+      rsa:
+        keySize: 8192
+`,
+			expectedAlgorithm:  configv1alpha1.KeyAlgorithmRSA,
+			expectedRSAKeySize: 8192,
+		},
+		"pki with ECDSA P521": {
+			installConfig: `
+apiVersion: v1
+metadata:
+  name: my-cluster
+pki:
+  signerCertificates:
+    key:
+      algorithm: ECDSA
+      ecdsa:
+        curve: P521
+`,
+			expectedAlgorithm:  configv1alpha1.KeyAlgorithmECDSA,
+			expectedECDSACurve: configv1alpha1.ECDSACurveP521,
+		},
+		"pki with invalid algorithm": {
+			installConfig: `
+apiVersion: v1
+metadata:
+  name: my-cluster
+pki:
+  signerCertificates:
+    key:
+      algorithm: DSA
+      rsa:
+        keySize: 2048
+`,
+			expectedError: true,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			var installConfig map[string]any
+			if err := yaml.Unmarshal([]byte(test.installConfig), &installConfig); err != nil {
+				t.Fatalf("failed to unmarshal test install-config: %v", err)
+			}
+
+			provider, err := getPKIProfileProvider(installConfig)
+
+			if test.expectedError {
+				if err == nil {
+					t.Errorf("expected error but got none")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if provider == nil {
+				t.Errorf("provider should not be nil")
+			}
+
+			// Get the profile from the provider
+			profile, err := provider.PKIProfile()
+			if err != nil {
+				t.Errorf("failed to get PKI profile from provider: %v", err)
+			}
+			if profile == nil {
+				t.Errorf("profile should not be nil")
+			}
+
+			// Verify defaults are always set
+			if profile.Defaults.Key.Algorithm != configv1alpha1.KeyAlgorithmECDSA {
+				t.Errorf("defaults should be ECDSA, got %v", profile.Defaults.Key.Algorithm)
+			}
+			if profile.Defaults.Key.ECDSA.Curve != configv1alpha1.ECDSACurveP256 {
+				t.Errorf("defaults should be P256, got %v", profile.Defaults.Key.ECDSA.Curve)
+			}
+
+			// Verify signer certificates configuration
+			if profile.SignerCertificates.Key.Algorithm != test.expectedAlgorithm {
+				t.Errorf("unexpected algorithm: want %v, got %v", test.expectedAlgorithm, profile.SignerCertificates.Key.Algorithm)
+			}
+
+			if test.expectedAlgorithm == configv1alpha1.KeyAlgorithmRSA {
+				if profile.SignerCertificates.Key.RSA.KeySize != test.expectedRSAKeySize {
+					t.Errorf("unexpected RSA key size: want %v, got %v", test.expectedRSAKeySize, profile.SignerCertificates.Key.RSA.KeySize)
+				}
+			} else if test.expectedAlgorithm == configv1alpha1.KeyAlgorithmECDSA {
+				if profile.SignerCertificates.Key.ECDSA.Curve != test.expectedECDSACurve {
+					t.Errorf("unexpected ECDSA curve: want %v, got %v", test.expectedECDSACurve, profile.SignerCertificates.Key.ECDSA.Curve)
+				}
+			}
+		})
+	}
+}
+
+func Test_getPKIProfileProvider_InvalidConfig(t *testing.T) {
+	tests := map[string]struct {
+		installConfig string
+	}{
+		"pki is not a map": {
+			installConfig: `
+apiVersion: v1
+metadata:
+  name: my-cluster
+pki: "not-a-map"
+`,
+		},
+		"pki exists but signerCertificates missing": {
+			installConfig: `
+apiVersion: v1
+metadata:
+  name: my-cluster
+pki:
+  foo: bar
+`,
+		},
+		"signerCertificates exists but key missing": {
+			installConfig: `
+apiVersion: v1
+metadata:
+  name: my-cluster
+pki:
+  signerCertificates:
+    foo: bar
+`,
+		},
+		"key exists but algorithm missing": {
+			installConfig: `
+apiVersion: v1
+metadata:
+  name: my-cluster
+pki:
+  signerCertificates:
+    key:
+      foo: bar
+`,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			var installConfig map[string]any
+			if err := yaml.Unmarshal([]byte(test.installConfig), &installConfig); err != nil {
+				t.Fatalf("failed to unmarshal test install-config: %v", err)
+			}
+
+			defer func() {
+				if r := recover(); r == nil {
+					t.Errorf("expected panic but didn't get one")
+				}
+			}()
+
+			getPKIProfileProvider(installConfig)
 		})
 	}
 }

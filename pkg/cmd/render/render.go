@@ -21,7 +21,10 @@ import (
 
 	"github.com/ghodss/yaml"
 	configv1 "github.com/openshift/api/config/v1"
+	configv1alpha1 "github.com/openshift/api/config/v1alpha1"
+	features "github.com/openshift/api/features"
 	"github.com/openshift/library-go/pkg/assets"
+	"github.com/openshift/library-go/pkg/pki"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -272,7 +275,15 @@ func newTemplateData(opts *renderOpts) (*TemplateData, error) {
 
 	enabledFeatureGates, disabledFeatureGates := getFeatureGatesStatus(installConfig)
 
-	certs, bundles, err := createBootstrapCertSecrets(templateData.Hostname, templateData.BootstrapIP, enabledFeatureGates, disabledFeatureGates)
+	var pkiProfileProvider pki.PKIProfileProvider
+	if enabledFeatureGates.Has(features.FeatureGateConfigurablePKI) {
+		pkiProfileProvider, err = getPKIProfileProvider(installConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get PKI profile provider: %w", err)
+		}
+	}
+
+	certs, bundles, err := createBootstrapCertSecrets(templateData.Hostname, templateData.BootstrapIP, enabledFeatureGates, disabledFeatureGates, pkiProfileProvider)
 	if err != nil {
 		return nil, err
 	}
@@ -803,4 +814,49 @@ func getFeatureGatesStatus(installConfig map[string]any) (sets.Set[configv1.Feat
 	}
 
 	return enabled, disabled
+}
+
+// getPKIProfileProvider extracts PKI configuration from install-config and returns a PKI profile provider.
+// Returns a provider with default profile if PKI is not specified in install-config.
+func getPKIProfileProvider(installConfig map[string]any) (pki.PKIProfileProvider, error) {
+	profile := pki.DefaultPKIProfile()
+
+	pkiData, found := installConfig["pki"]
+	if !found {
+		// no PKI config specified, fall back to defaults
+		return pki.NewStaticPKIProfileProvider(&profile), nil
+	}
+
+	// Installer uses local types that mirror configv1alpha1, and only supports
+	// signer certs configuration. If pki key is present but config is missing
+	// values, panic and prevent the cluster from starting up.
+	//TODO: link to installer config when PR merges
+	pkiMap := pkiData.(map[string]any)
+	signerCerts := pkiMap["signerCertificates"].(map[string]any)
+	keyConfig := signerCerts["key"].(map[string]any)
+
+	algorithm := keyConfig["algorithm"].(string)
+
+	var key configv1alpha1.KeyConfig
+	key.Algorithm = configv1alpha1.KeyAlgorithm(algorithm)
+
+	switch algorithm {
+	case "RSA":
+		rsaConfig := keyConfig["rsa"].(map[string]any)
+		// JSON numbers unmarshal as float64
+		keySize := rsaConfig["keySize"].(float64)
+		key.RSA = configv1alpha1.RSAKeyConfig{KeySize: int32(keySize)}
+
+	case "ECDSA":
+		ecdsaConfig := keyConfig["ecdsa"].(map[string]any)
+		curve := ecdsaConfig["curve"].(string)
+		key.ECDSA = configv1alpha1.ECDSAKeyConfig{Curve: configv1alpha1.ECDSACurve(curve)}
+
+	default:
+		return nil, fmt.Errorf("unsupported key algorithm %q in install-config pki.signerCertificates", algorithm)
+	}
+
+	profile.SignerCertificates = configv1alpha1.CertificateConfig{Key: key}
+
+	return pki.NewStaticPKIProfileProvider(&profile), nil
 }

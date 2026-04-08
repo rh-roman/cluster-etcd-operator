@@ -8,6 +8,7 @@ import (
 	"time"
 
 	configv1 "github.com/openshift/api/config/v1"
+	"github.com/openshift/api/features"
 	operatorv1 "github.com/openshift/api/operator/v1"
 	configv1client "github.com/openshift/client-go/config/clientset/versioned"
 	configversionedclientv1alpha1 "github.com/openshift/client-go/config/clientset/versioned/typed/config/v1alpha1"
@@ -32,6 +33,7 @@ import (
 	"github.com/openshift/library-go/pkg/operator/status"
 	"github.com/openshift/library-go/pkg/operator/unsupportedconfigoverridescontroller"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
+	"github.com/openshift/library-go/pkg/pki"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -428,6 +430,20 @@ func RunOperator(ctx context.Context, controllerContext *controllercmd.Controlle
 		return fmt.Errorf("timed out waiting for FeatureGate detection, aborting controller start")
 	}
 
+	featureGates, err := featureGateAccessor.CurrentFeatureGates()
+	if err != nil {
+		return fmt.Errorf("feature gate accessor: %v", err)
+	}
+
+	var additionalInformers []factory.Informer
+	var pkiProfileProvider pki.PKIProfileProvider
+	if featureGates.Enabled(features.FeatureGateConfigurablePKI) {
+		pkiProfileProvider = pki.NewClusterPKIProfileProvider(configInformers.Config().V1alpha1().PKIs().Lister())
+		additionalInformers = []factory.Informer{
+			configInformers.Config().V1alpha1().PKIs().Informer(),
+		}
+	}
+
 	etcdCertSignerController, err := etcdcertsigner.NewEtcdCertSignerController(
 		AlivenessChecker,
 		coreClient,
@@ -440,6 +456,8 @@ func RunOperator(ctx context.Context, controllerContext *controllercmd.Controlle
 		legacyregistry.DefaultGatherer.(metrics.KubeRegistry),
 		false,
 		featureGateAccessor,
+		pkiProfileProvider,
+		additionalInformers...,
 	)
 	if err != nil {
 		return fmt.Errorf("could not start etcdCertSignerController, aborting controller start: %w", err)
