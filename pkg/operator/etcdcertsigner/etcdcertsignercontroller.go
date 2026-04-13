@@ -22,15 +22,15 @@ import (
 
 	apiannotations "github.com/openshift/api/annotations"
 	operatorv1 "github.com/openshift/api/operator/v1"
-	"github.com/openshift/cluster-etcd-operator/pkg/operator/health"
 	configinformers "github.com/openshift/client-go/config/informers/externalversions"
+	"github.com/openshift/cluster-etcd-operator/pkg/operator/health"
 	"github.com/openshift/library-go/pkg/controller/factory"
 	"github.com/openshift/library-go/pkg/operator/certrotation"
 	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
 	"github.com/openshift/library-go/pkg/operator/events"
-	"github.com/openshift/library-go/pkg/pki"
 	"github.com/openshift/library-go/pkg/operator/resource/resourceapply"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
+	"github.com/openshift/library-go/pkg/pki"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -115,6 +115,7 @@ func NewEtcdCertSignerController(
 	forceSkipRollout bool,
 	featureGateAccessor featuregates.FeatureGateAccess,
 	configInformer configinformers.SharedInformerFactory,
+	staticPKIProvider pki.PKIProfileProvider,
 ) (factory.Controller, error) {
 	eventRecorder = eventRecorder.WithComponentSuffix("etcd-cert-signer-controller")
 	cmInformer := kubeInformers.InformersFor(operatorclient.TargetNamespace).Core().V1().ConfigMaps()
@@ -167,8 +168,13 @@ func NewEtcdCertSignerController(
 		}
 	}
 
+	// Determine PKI profile provider: use static provider (for render), or create from informer (for running cluster)
 	var pkiProfileProvider pki.PKIProfileProvider
-	if featureGates.Enabled(features.FeatureGateConfigurablePKI) && configInformer != nil {
+	if staticPKIProvider != nil {
+		// Render path: use provided static provider
+		pkiProfileProvider = staticPKIProvider
+	} else if featureGates.Enabled(features.FeatureGateConfigurablePKI) && configInformer != nil {
+		// Running cluster path: create from config informer
 		pkiProfileProvider = pki.NewClusterPKIProfileProvider(configInformer.Config().V1alpha1().PKIs().Lister())
 	}
 

@@ -441,6 +441,7 @@ func RunOperator(ctx context.Context, controllerContext *controllercmd.Controlle
 		false,
 		featureGateAccessor,
 		configInformers,
+		nil, // should be nil for running cluster
 	)
 	if err != nil {
 		return fmt.Errorf("could not start etcdCertSignerController, aborting controller start: %w", err)

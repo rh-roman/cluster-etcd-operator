@@ -620,7 +620,9 @@ func setupController(t *testing.T, objects []runtime.Object, forceSkipRollout bo
 		registry,
 		forceSkipRollout,
 		featureGateAccessor,
-		nil)
+		nil, // configInformer
+		nil, // staticPKIProvider
+	)
 	require.NoError(t, err)
 
 	stopChan := make(chan struct{})

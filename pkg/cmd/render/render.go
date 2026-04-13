@@ -21,7 +21,10 @@ import (
 
 	"github.com/ghodss/yaml"
 	configv1 "github.com/openshift/api/config/v1"
+	configv1alpha1 "github.com/openshift/api/config/v1alpha1"
+	features "github.com/openshift/api/features"
 	"github.com/openshift/library-go/pkg/assets"
+	"github.com/openshift/library-go/pkg/pki"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -272,7 +275,15 @@ func newTemplateData(opts *renderOpts) (*TemplateData, error) {
 
 	enabledFeatureGates, disabledFeatureGates := getFeatureGatesStatus(installConfig)
 
-	certs, bundles, err := createBootstrapCertSecrets(templateData.Hostname, templateData.BootstrapIP, enabledFeatureGates, disabledFeatureGates)
+	var pkiProfile *configv1alpha1.PKIProfile
+	if enabledFeatureGates.Has(features.FeatureGateConfigurablePKI) {
+		pkiProfile, err = getPKIConfig(installConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get PKI config: %w", err)
+		}
+	}
+
+	certs, bundles, err := createBootstrapCertSecrets(templateData.Hostname, templateData.BootstrapIP, enabledFeatureGates, disabledFeatureGates, pkiProfile)
 	if err != nil {
 		return nil, err
 	}
@@ -803,4 +814,56 @@ func getFeatureGatesStatus(installConfig map[string]interface{}) (sets.Set[confi
 	}
 
 	return enabled, disabled
+}
+
+// getPKIConfig extracts PKI configuration from install-config and converts it to configv1alpha1.PKIProfile.
+// Returns nil if PKI is not specified in install-config.
+func getPKIConfig(installConfig map[string]interface{}) (*configv1alpha1.PKIProfile, error) {
+	pkiData, found := installConfig["pki"]
+	if !found {
+		// no PKI config specified, let library-go choose defaults
+		return nil, nil
+	}
+
+	pkiJSON, err := json.Marshal(pkiData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal PKI config: %w", err)
+	}
+
+	// Installer uses local types, not configv1alpha1, duplicating that config here
+	var localPKI struct {
+		SignerCertificates struct {
+			Key struct {
+				Algorithm string `json:"algorithm"`
+				RSA       struct {
+					KeySize int32 `json:"keySize"`
+				} `json:"rsa"`
+				ECDSA struct {
+					Curve string `json:"curve"`
+				} `json:"ecdsa"`
+			} `json:"key"`
+		} `json:"signerCertificates"`
+	}
+
+	if err := json.Unmarshal(pkiJSON, &localPKI); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal PKI config: %w", err)
+	}
+
+	keyConfig := configv1alpha1.KeyConfig{
+		Algorithm: configv1alpha1.KeyAlgorithm(localPKI.SignerCertificates.Key.Algorithm),
+	}
+
+	switch localPKI.SignerCertificates.Key.Algorithm {
+	case "RSA":
+		keyConfig.RSA = configv1alpha1.RSAKeyConfig{KeySize: localPKI.SignerCertificates.Key.RSA.KeySize}
+	case "ECDSA":
+		keyConfig.ECDSA = configv1alpha1.ECDSAKeyConfig{Curve: configv1alpha1.ECDSACurve(localPKI.SignerCertificates.Key.ECDSA.Curve)}
+	default:
+		return nil, fmt.Errorf("unsupported key algorithm %q in install-config pki.signerCertificates", localPKI.SignerCertificates.Key.Algorithm)
+	}
+
+	profile := pki.DefaultPKIProfile()
+	profile.SignerCertificates = configv1alpha1.CertificateConfig{Key: keyConfig}
+
+	return &profile, nil
 }

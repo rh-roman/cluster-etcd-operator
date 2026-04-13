@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	configv1 "github.com/openshift/api/config/v1"
+	configv1alpha1 "github.com/openshift/api/config/v1alpha1"
 	operatorv1 "github.com/openshift/api/operator/v1"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/etcdcertsigner"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/health"
@@ -14,6 +15,7 @@ import (
 	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
 	"github.com/openshift/library-go/pkg/operator/events"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
+	"github.com/openshift/library-go/pkg/pki"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -26,7 +28,7 @@ import (
 
 // createCertSecrets will run the etcdcertsigner.EtcdCertSignerController once and collect all respective certs created.
 // The secrets will contain all signers, peer, serving and client certs. The configmaps contain all bundles.
-func createCertSecrets(nodes []*corev1.Node, enabledFeatureGates, disabledFeatureGates sets.Set[configv1.FeatureGateName]) ([]corev1.Secret, []corev1.ConfigMap, error) {
+func createCertSecrets(nodes []*corev1.Node, enabledFeatureGates, disabledFeatureGates sets.Set[configv1.FeatureGateName], pkiProfile *configv1alpha1.PKIProfile) ([]corev1.Secret, []corev1.ConfigMap, error) {
 	var fakeObjs []runtime.Object
 	for _, node := range nodes {
 		fakeObjs = append(fakeObjs, node)
@@ -53,6 +55,14 @@ func createCertSecrets(nodes []*corev1.Node, enabledFeatureGates, disabledFeatur
 	}
 
 	featureGateAccessor := featuregates.NewHardcodedFeatureGateAccess(enabledFeatureGates.UnsortedList(), disabledFeatureGates.UnsortedList())
+
+	// If a profile is present, we are probably in the render path and
+	// should use the staticPKIProvider
+	var pkiProvider pki.PKIProfileProvider
+	if pkiProfile != nil {
+		pkiProvider = pki.NewStaticPKIProfileProvider(pkiProfile)
+	}
+
 	controller, err := etcdcertsigner.NewEtcdCertSignerController(
 		health.NewMultiAlivenessChecker(),
 		fakeKubeClient,
@@ -65,7 +75,9 @@ func createCertSecrets(nodes []*corev1.Node, enabledFeatureGates, disabledFeatur
 		metrics.NewKubeRegistry(),
 		true,
 		featureGateAccessor,
-		nil)
+		nil,
+		pkiProvider,
+	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("could not run etcdCertSignerController control loop: %w", err)
 	}
@@ -123,11 +135,11 @@ func createCertSecrets(nodes []*corev1.Node, enabledFeatureGates, disabledFeatur
 	return secrets, bundles, nil
 }
 
-func createBootstrapCertSecrets(hostName string, ipAddress string, enabledFeatureGates, disabledFeatureGates sets.Set[configv1.FeatureGateName]) ([]corev1.Secret, []corev1.ConfigMap, error) {
+func createBootstrapCertSecrets(hostName string, ipAddress string, enabledFeatureGates, disabledFeatureGates sets.Set[configv1.FeatureGateName], pkiProfile *configv1alpha1.PKIProfile) ([]corev1.Secret, []corev1.ConfigMap, error) {
 	return createCertSecrets([]*corev1.Node{
 		{
 			ObjectMeta: metav1.ObjectMeta{Name: hostName, Labels: map[string]string{"node-role.kubernetes.io/master": ""}},
 			Status:     corev1.NodeStatus{Addresses: []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: ipAddress}}},
 		},
-	}, enabledFeatureGates, disabledFeatureGates)
+	}, enabledFeatureGates, disabledFeatureGates, pkiProfile)
 }
